@@ -38,9 +38,6 @@ export const ALARM_CMD = process.env.ALARM_CMD ?? "";
 // Speak the alert with macOS `say`. 1 = on (default on macOS).
 export const SAY = (process.env.SAY ?? (process.platform === "darwin" ? "1" : "0")) !== "0";
 
-// Priority fee used in the ready-to-run `cast send --trezor` command we print.
-export const PRIORITY_GWEI = process.env.PRIORITY_GWEI ?? "10";
-
 export const LOGFILE = process.env.LOGFILE ?? "morpho-monitor.log";
 
 export interface MarketParams {

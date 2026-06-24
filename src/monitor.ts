@@ -58,7 +58,6 @@ import {
   ALARM_COOLDOWN_SEC,
   ALARM_CMD,
   SAY,
-  PRIORITY_GWEI,
   LOGFILE,
   type VaultConfig,
 } from "./config.js";
@@ -147,14 +146,6 @@ function buildCalls(v: VaultConfig, amount: bigint): [Hex, Hex] {
     args: [amount, v.receiver, v.owner],
   });
   return [forceDeallocate, withdraw];
-}
-
-/** The exact command the owner pastes to withdraw via their Trezor. */
-function trezorCommand(v: VaultConfig, calls: [Hex, Hex]): string {
-  return (
-    `cast send ${v.vault} 'multicall(bytes[])' '[${calls[0]},${calls[1]}]' ` +
-    `--rpc-url ${RPC_HTTP} --trezor --priority-gas-price ${PRIORITY_GWEI}gwei`
-  );
 }
 
 async function wouldSucceed(v: VaultConfig, calls: [Hex, Hex]): Promise<boolean> {
@@ -278,11 +269,8 @@ async function onBlock(blockNumber: bigint) {
           `${formatUnits(own, 6)} USDC   -> withdraw up to ${amtH} USDC NOW`,
         "ALERT",
       );
-      log("    Run this and confirm on your Trezor:", "ALERT");
-      log("    " + trezorCommand(v, calls), "ALERT");
       log(
-        `    (or use the Morpho app — but a plain Withdraw may fail; this ` +
-          `forceDeallocate+withdraw is the reliable path)`,
+        `    Withdraw now: https://app.morpho.org/ethereum/vault/${v.vault}`,
         "ALERT",
       );
       log("🚨".repeat(20), "ALERT");
@@ -316,7 +304,7 @@ async function main() {
   for (const v of VAULTS) {
     log(`  watching ${v.name}  owner=${v.owner}`);
   }
-  log("No private keys here. When it fires, withdraw with your Trezor.");
+  log("No private keys here. When it fires, withdraw manually.");
   log("=".repeat(70));
 
   // Smoke-test the alarm once at startup so you know it's audible.

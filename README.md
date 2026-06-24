@@ -2,9 +2,9 @@
 
 Sounds a loud alarm the moment withdrawable liquidity appears in two illiquid
 (100%-utilization) Morpho Blue markets, so the owner can withdraw **manually**.
-There is **no automated withdrawal and no private key here** — the funds sit on a
-Trezor. When the alarm fires, the tool also prints a ready-to-paste
-`cast send --trezor` command that does the withdrawal with on-device confirmation.
+There is **no automated withdrawal and no private key here** — it only watches and
+screams. The alarm is gated on a successful withdrawal simulation, so it only
+fires when the money is genuinely withdrawable that block (no false alarms).
 
 ## The two positions
 
@@ -62,9 +62,9 @@ npm start
 
 That's it — no keys, nothing to broadcast. It reads both markets every block and
 prints a heartbeat. When a real window opens it:
-1. prints a 🚨 banner with the market liquidity, your position, and the amount,
-2. plays a loud, repeating sound + macOS notification + spoken announcement,
-3. prints the exact `cast send --trezor …` command to withdraw.
+1. prints a 🚨 banner with the market liquidity, your position, the withdrawable
+   amount, and the vault's Morpho app link,
+2. plays a loud, repeating sound + macOS notification + spoken announcement.
 
 Test the sound first so you know it's audible:
 
@@ -72,23 +72,17 @@ Test the sound first so you know it's audible:
 TEST_ALARM=1 npm start
 ```
 
-## When the alarm fires — withdraw with the Trezor
+## When the alarm fires — withdraw manually
 
-Copy the printed command and run it (needs [Foundry](https://getfoundry.sh)'s
-`cast` + Trezor Suite/bridge running). It looks like:
+Open the vault in the Morpho app (link is printed in the alert) and withdraw with
+your wallet:
 
-```bash
-cast send 0x36cfe1…2439 'multicall(bytes[])' '[0xe4d38cd8…,0xb460af94…]' \
-  --rpc-url <rpc> --trezor --priority-gas-price 10gwei
-```
+- Alpha USDC Asia V2: https://app.morpho.org/ethereum/vault/0x35Cbe8542E70fa2f7F9cDF129F19e593F4b4f560
+- Api3 dCOMP USDC: https://app.morpho.org/ethereum/vault/0x36cfe1568461E499391ef0A555300F1ae2da2439
 
-Confirm the transaction on the Trezor screen. The key never leaves the device.
-- If your Trezor account isn't on the default derivation path, add
-  `--mnemonic-derivation-path "m/44'/60'/0'/0/N"`.
-- The amount in the command is sized to the live window; if it shrank, the tx
-  reverts harmlessly — wait for the next alarm and use the fresh command.
-- The Morpho app *may* also work, but a plain "Withdraw" there can fail for the
-  reason above; the `cast` command is the reliable path.
+Heads-up: a plain "Withdraw" can fail on these vaults (the underflow above) — if
+the app errors or shows 0 withdrawable, you need the `forceDeallocate`+`withdraw`
+path instead. Ping me and I'll hand you the exact transaction to sign.
 
 ## Key env vars (all optional)
 
@@ -102,8 +96,6 @@ Confirm the transaction on the Trezor screen. The key never leaves the device.
 | `POLL_SECONDS` | `4` | HTTP block-poll interval (~12s blocks) |
 | `RPC_HTTP` | publicnode | a private/paid endpoint is more reliable |
 | `RPC_WS` | — | set a `wss://` endpoint for true newHeads (lower latency) |
-| `PRIORITY_GWEI` | `10` | priority fee written into the printed `cast` command |
-| `RECEIVER_ALPHA` / `RECEIVER_API3` | = owner | where withdrawn USDC lands |
 
 ## Notes / limitations
 
