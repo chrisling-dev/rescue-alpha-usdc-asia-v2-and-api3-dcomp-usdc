@@ -1,0 +1,5 @@
+node_modules/
+dist/
+morpho-monitor.log
+.env
+.env.local
