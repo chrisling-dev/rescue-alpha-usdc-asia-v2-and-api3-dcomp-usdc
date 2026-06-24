@@ -5,27 +5,26 @@
  * Vault V2 vaults. The instant withdrawable liquidity appears in a market
  * (a borrower repays, a position is liquidated, or someone supplies), it sounds
  * a loud alarm so the owner can withdraw manually — there is NO automated
- * withdrawal and NO private key here (the funds are on a Trezor).
+ * withdrawal and NO private key here. It only watches and screams.
  *
  * Liquidity is read directly from Morpho Blue:
  *     liquidity = market.totalSupplyAssets - market.totalBorrowAssets
  * Exact at 100% utilization (interest accrues equally to supply and borrow).
  *
- * WHY A PLAIN WITHDRAW WON'T WORK: on these vaults a normal ERC-4626 `withdraw`
- * reverts with an arithmetic underflow (the auto-liquidity path is fed
- * empty/misconfigured market data), and `maxWithdraw` returns 0 even when the
- * market has liquidity. The working exit is an atomic multicall:
+ * NO FALSE ALARMS: a normal ERC-4626 `withdraw` reverts with an arithmetic
+ * underflow on these vaults (the auto-liquidity path is fed empty/misconfigured
+ * market data) and `maxWithdraw` returns 0 even when the market has liquidity.
+ * So instead of trusting a raw liquidity read, we gate the alarm on a successful
+ * eth_call simulation of the real exit:
  *
  *     multicall([
  *       forceDeallocate(adapter, abi.encode(marketParams), amount, owner),
  *       withdraw(amount, receiver, owner),
  *     ])
  *
- * So when the alarm fires we ALSO print a ready-to-run `cast send --trezor`
- * command for exactly that multicall, sized to the live window. The owner runs
- * it and confirms on the Trezor device — no key ever leaves the hardware wallet.
- * The alarm is gated on a successful eth_call simulation, so it only fires when
- * the withdrawal would actually succeed right now.
+ * The alarm only fires when that simulation succeeds — i.e. when the funds are
+ * genuinely withdrawable that block. The owner then withdraws manually (Morpho
+ * app link is printed in the alert).
  *
  * Trigger model: block-driven (newHeads via WebSocket if RPC_WS is set, else
  * HTTP block polling).
