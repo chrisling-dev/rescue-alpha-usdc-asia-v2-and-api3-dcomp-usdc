@@ -1,55 +1,49 @@
 /**
- * Morpho Vault V2 withdrawal monitor + auto-withdrawer (TypeScript / viem).
+ * Morpho Vault V2 liquidity ALARM (TypeScript / viem).
  *
  * Watches two illiquid (100%-utilization) Morpho Blue markets that back two
- * Vault V2 vaults. The instant available liquidity appears in a market
- * (a borrower repays, a position is liquidated, or someone supplies), it pulls
- * that liquidity out for the owner — racing the vault's other depositors.
+ * Vault V2 vaults. The instant withdrawable liquidity appears in a market
+ * (a borrower repays, a position is liquidated, or someone supplies), it sounds
+ * a loud alarm so the owner can withdraw manually — there is NO automated
+ * withdrawal and NO private key here (the funds are on a Trezor).
  *
  * Liquidity is read directly from Morpho Blue:
  *     liquidity = market.totalSupplyAssets - market.totalBorrowAssets
- * Exact at 100% utilization (interest accrues equally to supply and borrow,
- * so their difference is unaffected — no accrual needed).
+ * Exact at 100% utilization (interest accrues equally to supply and borrow).
  *
- * WITHDRAWAL MECHANISM (important): a plain ERC-4626 `withdraw`/`redeem` reverts
- * with an arithmetic underflow on these vaults — the auto-liquidity path is fed
- * empty/misconfigured market data, and `maxWithdraw(owner)` returns 0 even when
- * the market has liquidity. The working exit is to pull liquidity into the
- * vault's idle balance ourselves and withdraw it in the SAME transaction:
+ * WHY A PLAIN WITHDRAW WON'T WORK: on these vaults a normal ERC-4626 `withdraw`
+ * reverts with an arithmetic underflow (the auto-liquidity path is fed
+ * empty/misconfigured market data), and `maxWithdraw` returns 0 even when the
+ * market has liquidity. The working exit is an atomic multicall:
  *
  *     multicall([
  *       forceDeallocate(adapter, abi.encode(marketParams), amount, owner),
  *       withdraw(amount, receiver, owner),
  *     ])
  *
- * forceDeallocate charges a penalty (dCOMP ~0.01%, AZND ~2%). We simulate the
- * multicall (eth_call) before every broadcast, so a closed/shrunk window just
- * reverts harmlessly (gas only) and we retry on the next block.
+ * So when the alarm fires we ALSO print a ready-to-run `cast send --trezor`
+ * command for exactly that multicall, sized to the live window. The owner runs
+ * it and confirms on the Trezor device — no key ever leaves the hardware wallet.
+ * The alarm is gated on a successful eth_call simulation, so it only fires when
+ * the withdrawal would actually succeed right now.
  *
  * Trigger model: block-driven (newHeads via WebSocket if RPC_WS is set, else
- * HTTP block polling). SAFETY: starts in DRY_RUN — simulates and prints, but
- * broadcasts nothing until DRY_RUN=0 and a per-vault signer are provided.
+ * HTTP block polling).
  */
 import { appendFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import {
   createPublicClient,
-  createWalletClient,
   http,
   webSocket,
   encodeAbiParameters,
   encodeFunctionData,
   formatUnits,
   parseUnits,
-  parseGwei,
-  getAddress,
-  type Account,
-  type Address,
   type Hex,
   type PublicClient,
-  type WalletClient,
   BaseError,
 } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
 import { mainnet } from "viem/chains";
 import { morphoAbi, vaultAbi } from "./abi.js";
 import {
@@ -58,13 +52,14 @@ import {
   RPC_HTTP,
   RPC_WS,
   POLL_MS,
-  DRY_RUN,
   MIN_TRIGGER_USDC,
   SAFETY_BUFFER_USDC,
+  CONFIRM_BY_SIM,
+  ALARM_COOLDOWN_SEC,
+  ALARM_CMD,
+  SAY,
   PRIORITY_GWEI,
-  MAX_FEE_GWEI,
   LOGFILE,
-  EXIT_AFTER_FULL,
   type VaultConfig,
 } from "./config.js";
 
@@ -80,37 +75,19 @@ function log(msg: string, level = "INFO") {
   }
 }
 
-// ── clients ──────────────────────────────────────────────────────────────
+function revertReason(err: unknown): string {
+  const collapse = (s: string) =>
+    s.replace(/\s*\n\s*/g, " ").trim().slice(0, 200);
+  if (err instanceof BaseError) return collapse(err.shortMessage || err.message);
+  return err instanceof Error ? collapse(err.message) : String(err);
+}
+
+// ── client ──────────────────────────────────────────────────────────────────
 const publicClient: PublicClient = createPublicClient({
   chain: mainnet,
   transport: RPC_WS ? webSocket(RPC_WS) : http(RPC_HTTP),
   pollingInterval: POLL_MS,
 });
-
-// Per-vault signer (only needed when DRY_RUN=0). Keyed by vault address.
-const wallets = new Map<Address, { account: Account; client: WalletClient }>();
-
-function loadSigners() {
-  for (const v of VAULTS) {
-    const pk = process.env[v.keyEnv];
-    if (!pk) continue;
-    const account = privateKeyToAccount(pk as Hex);
-    if (getAddress(account.address) !== getAddress(v.owner)) {
-      log(
-        `signer for ${v.name} is ${account.address} but vault owner is ` +
-          `${v.owner} — they must match. Skipping this vault's signer.`,
-        "ERROR",
-      );
-      continue;
-    }
-    const client = createWalletClient({
-      account,
-      chain: mainnet,
-      transport: http(RPC_HTTP),
-    });
-    wallets.set(getAddress(v.vault), { account, client });
-  }
-}
 
 // ── reads ──────────────────────────────────────────────────────────────────
 async function readMarketLiquidity(v: VaultConfig): Promise<bigint> {
@@ -120,10 +97,7 @@ async function readMarketLiquidity(v: VaultConfig): Promise<bigint> {
     functionName: "market",
     args: [v.marketId],
   });
-  // [totalSupplyAssets, totalSupplyShares, totalBorrowAssets, ...]
-  const supply = m[0];
-  const borrow = m[2];
-  return supply - borrow;
+  return m[0] - m[2]; // totalSupplyAssets - totalBorrowAssets
 }
 
 async function readOwnerAssets(v: VaultConfig): Promise<bigint> {
@@ -142,7 +116,7 @@ async function readOwnerAssets(v: VaultConfig): Promise<bigint> {
   });
 }
 
-// ── exit path: build + simulate + send ──────────────────────────────────────
+// ── withdrawal command (forceDeallocate + withdraw multicall) ────────────────
 function encodeMarketParams(v: VaultConfig): Hex {
   return encodeAbiParameters(
     [
@@ -175,106 +149,73 @@ function buildCalls(v: VaultConfig, amount: bigint): [Hex, Hex] {
   return [forceDeallocate, withdraw];
 }
 
-function revertReason(err: unknown): string {
-  const collapse = (s: string) =>
-    s.replace(/\s*\n\s*/g, " ").trim().slice(0, 200);
-  if (err instanceof BaseError) {
-    return collapse(err.shortMessage || err.message);
-  }
-  return err instanceof Error ? collapse(err.message) : String(err);
+/** The exact command the owner pastes to withdraw via their Trezor. */
+function trezorCommand(v: VaultConfig, calls: [Hex, Hex]): string {
+  return (
+    `cast send ${v.vault} 'multicall(bytes[])' '[${calls[0]},${calls[1]}]' ` +
+    `--rpc-url ${RPC_HTTP} --trezor --priority-gas-price ${PRIORITY_GWEI}gwei`
+  );
 }
 
-/** Simulate the atomic multicall from the owner. Returns true if it would succeed. */
-async function simulate(v: VaultConfig, calls: [Hex, Hex]): Promise<boolean> {
+async function wouldSucceed(v: VaultConfig, calls: [Hex, Hex]): Promise<boolean> {
   try {
     await publicClient.simulateContract({
-      account: v.owner, // msg.sender override for the simulation
+      account: v.owner,
       address: v.vault,
       abi: vaultAbi,
       functionName: "multicall",
       args: [[calls[0], calls[1]]],
     });
     return true;
-  } catch (err) {
-    log(
-      `  simulation reverted (${revertReason(err)}); window likely ` +
-        `closed/shrank. Retrying next block.`,
-      "WARN",
-    );
+  } catch {
     return false;
   }
 }
 
-async function execute(
-  v: VaultConfig,
-  amount: bigint,
-  amountHuman: string,
-): Promise<boolean> {
-  const calls = buildCalls(v, amount);
-
-  // Always simulate first — confirms the window is open and the sizes are valid.
-  if (!(await simulate(v, calls))) return false;
-
-  if (DRY_RUN) {
-    log(
-      `[DRY_RUN] simulation OK — WOULD withdraw ${amountHuman} USDC from ` +
-        `${v.name} (owner ${v.owner}) via forceDeallocate+withdraw multicall.`,
-      "ACTION",
-    );
-    return false;
-  }
-
-  const signer = wallets.get(getAddress(v.vault));
-  if (!signer) {
-    log(`  no signer for ${v.name}; cannot broadcast.`, "ERROR");
-    return false;
-  }
-
-  log(
-    `BROADCASTING forceDeallocate+withdraw of ${amountHuman} USDC from ` +
-      `${v.name} ...`,
-    "ACTION",
-  );
+// ── alarm ────────────────────────────────────────────────────────────────────
+function runDetached(cmd: string) {
   try {
-    const hash = await signer.client.writeContract({
-      account: signer.account,
-      chain: mainnet,
-      address: v.vault,
-      abi: vaultAbi,
-      functionName: "multicall",
-      args: [[calls[0], calls[1]]],
-      maxPriorityFeePerGas: parseGwei(PRIORITY_GWEI),
-      ...(MAX_FEE_GWEI ? { maxFeePerGas: parseGwei(MAX_FEE_GWEI) } : {}),
-    });
-    log(`  sent tx=${hash} — waiting for receipt...`, "ACTION");
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    if (receipt.status === "success") {
-      log(`  SUCCESS  tx=${hash}  block=${receipt.blockNumber}`, "ACTION");
-      return true;
-    }
-    log(`  tx REVERTED on-chain  tx=${hash}`, "ERROR");
-    return false;
-  } catch (err) {
-    log(`  send FAILED: ${revertReason(err)}`, "ERROR");
-    return false;
+    const child = spawn("sh", ["-c", cmd], { detached: true, stdio: "ignore" });
+    child.unref();
+    child.on("error", () => {});
+  } catch {
+    /* ignore */
+  }
+}
+
+function soundAlarm(spoken: string) {
+  process.stdout.write("\x07\x07\x07"); // terminal bell (cross-platform)
+  if (ALARM_CMD) {
+    runDetached(ALARM_CMD);
+  } else if (process.platform === "darwin") {
+    // Loud, repeating system sound.
+    runDetached(
+      "for i in 1 2 3 4 5; do afplay /System/Library/Sounds/Sonar.aiff; done",
+    );
+    // Desktop notification.
+    runDetached(
+      `osascript -e 'display notification "${spoken}" with title "Morpho liquidity!" sound name "Sonar"'`,
+    );
+  }
+  if (SAY && process.platform === "darwin") {
+    runDetached(`say -r 190 ${JSON.stringify(spoken)}`);
   }
 }
 
 // ── per-block logic ──────────────────────────────────────────────────────────
-const drained = new Set<Address>();
 const triggerWei = parseUnits(String(MIN_TRIGGER_USDC), 6);
 const bufferWei = parseUnits(String(SAFETY_BUFFER_USDC), 6);
+const open = new Set<string>(); // vaults currently in an open window (edge state)
+const lastSound = new Map<string, number>(); // vault -> ms timestamp
 let processing = false;
 let heartbeat = 0;
 
 async function onBlock(blockNumber: bigint) {
-  if (processing) return; // avoid overlapping runs on slow RPC
+  if (processing) return;
   processing = true;
   try {
     const status: string[] = [];
     for (const v of VAULTS) {
-      if (drained.has(getAddress(v.vault))) continue;
-
       let liq: bigint;
       try {
         liq = await readMarketLiquidity(v);
@@ -284,9 +225,15 @@ async function onBlock(blockNumber: bigint) {
       }
       status.push(`${v.name.split(" ")[0]}=${formatUnits(liq, 6)}`);
 
-      if (liq < triggerWei) continue;
+      if (liq < triggerWei) {
+        if (open.has(v.vault)) {
+          log(`${v.name}: window closed (liquidity back below trigger).`, "INFO");
+          open.delete(v.vault);
+        }
+        continue;
+      }
 
-      // Liquidity appeared — cap the grab by the owner's own position value.
+      // There's liquidity. Size the grab by the owner's position.
       let own: bigint;
       try {
         own = await readOwnerAssets(v);
@@ -294,58 +241,63 @@ async function onBlock(blockNumber: bigint) {
         log(`${v.name}: owner-assets read error: ${revertReason(err)}`, "WARN");
         continue;
       }
-
-      log(
-        `*** LIQUIDITY DETECTED in ${v.name} at block ${blockNumber}: ` +
-          `${formatUnits(liq, 6)} USDC in market, owner position=` +
-          `${formatUnits(own, 6)} USDC`,
-        "ALERT",
-      );
-
-      if (own < triggerWei) {
-        log(
-          `    owner position (${formatUnits(own, 6)}) below trigger; skipping.`,
-          "ALERT",
-        );
-        continue;
-      }
+      if (own < triggerWei) continue;
 
       const amount = (liq < own ? liq : own) - bufferWei;
       if (amount <= 0n) continue;
 
-      const ok = await execute(v, amount, formatUnits(amount, 6));
-      if (ok) {
-        let rem = -1n;
-        try {
-          rem = await readOwnerAssets(v);
-        } catch {
-          /* ignore */
-        }
-        if (rem >= 0n && rem < triggerWei) {
+      const calls = buildCalls(v, amount);
+
+      // Only alarm if the withdrawal would actually succeed right now.
+      if (CONFIRM_BY_SIM && !(await wouldSucceed(v, calls))) {
+        if (!open.has(v.vault)) {
           log(
-            `    ${v.name}: position drained (remaining ${formatUnits(
-              rem,
-              6,
-            )} USDC).`,
-            "ACTION",
+            `${v.name}: market shows ${formatUnits(liq, 6)} USDC but the ` +
+              `withdrawal does not simulate yet — not alarming.`,
+            "INFO",
           );
-          drained.add(getAddress(v.vault));
-          if (EXIT_AFTER_FULL) {
-            log("EXIT_AFTER_FULL set — done.", "ACTION");
-            process.exit(0);
-          }
         }
+        continue;
       }
+
+      const liqH = formatUnits(liq, 6);
+      const amtH = formatUnits(amount, 6);
+      const spoken =
+        `Liquidity in ${v.name.split(" ")[0]} vault. ` +
+        `You can withdraw about ${Math.floor(Number(amtH))} dollars now.`;
+
+      // Banner every block; sound is cooldown-gated.
+      log("", "ALERT");
+      log("🚨".repeat(20), "ALERT");
+      log(
+        `*** WITHDRAW WINDOW OPEN — ${v.name} @ block ${blockNumber} ***`,
+        "ALERT",
+      );
+      log(
+        `    market liquidity: ${liqH} USDC   your position: ` +
+          `${formatUnits(own, 6)} USDC   -> withdraw up to ${amtH} USDC NOW`,
+        "ALERT",
+      );
+      log("    Run this and confirm on your Trezor:", "ALERT");
+      log("    " + trezorCommand(v, calls), "ALERT");
+      log(
+        `    (or use the Morpho app — but a plain Withdraw may fail; this ` +
+          `forceDeallocate+withdraw is the reliable path)`,
+        "ALERT",
+      );
+      log("🚨".repeat(20), "ALERT");
+
+      const now = Date.now();
+      if (now - (lastSound.get(v.vault) ?? 0) >= ALARM_COOLDOWN_SEC * 1000) {
+        soundAlarm(spoken);
+        lastSound.set(v.vault, now);
+      }
+      open.add(v.vault);
     }
 
     heartbeat += 1;
     if (status.length && heartbeat % 25 === 1) {
       log(`block ${blockNumber}  liquidity → ${status.join("  ")}`);
-    }
-
-    if (drained.size === VAULTS.length) {
-      log("All positions withdrawn. Monitor done.", "ACTION");
-      process.exit(0);
     }
   } finally {
     processing = false;
@@ -354,42 +306,28 @@ async function onBlock(blockNumber: bigint) {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 async function main() {
-  loadSigners();
-
   log("=".repeat(70));
-  log("Morpho Vault V2 withdrawal monitor starting (viem/TS)");
+  log("Morpho Vault V2 liquidity ALARM starting (viem/TS) — alert only");
   log(`RPC=${RPC_WS || RPC_HTTP}  mode=${RPC_WS ? "newHeads" : "poll"}`);
   log(
-    `DRY_RUN=${DRY_RUN ? "ON (no broadcasts)" : "OFF — WILL BROADCAST"}  ` +
-      `trigger>=${MIN_TRIGGER_USDC} USDC  priority=${PRIORITY_GWEI}gwei`,
+    `trigger>=${MIN_TRIGGER_USDC} USDC  confirmBySim=${CONFIRM_BY_SIM}  ` +
+      `sound=${process.platform === "darwin" ? "macOS" : ALARM_CMD ? "custom" : "bell-only"}`,
   );
   for (const v of VAULTS) {
-    const sig = wallets.has(getAddress(v.vault)) ? "signer SET" : "NO signer";
-    log(`  watching ${v.name}`);
-    log(
-      `    vault=${v.vault}  owner=${v.owner}  receiver=${v.receiver}  [${sig}]`,
-    );
+    log(`  watching ${v.name}  owner=${v.owner}`);
   }
-  if (!DRY_RUN) {
-    const missing = VAULTS.filter((v) => !wallets.has(getAddress(v.vault)));
-    if (missing.length) {
-      log(
-        `DRY_RUN=0 but no signer for: ${missing
-          .map((v) => v.name)
-          .join(", ")}. Set the per-vault key env vars. Exiting.`,
-        "ERROR",
-      );
-      process.exit(1);
-    }
-  }
+  log("No private keys here. When it fires, withdraw with your Trezor.");
   log("=".repeat(70));
 
-  // Block-driven trigger.
+  // Smoke-test the alarm once at startup so you know it's audible.
+  if (process.env.TEST_ALARM === "1") {
+    log("TEST_ALARM=1 — firing a test alarm now.", "ALERT");
+    soundAlarm("Test alarm. Morpho monitor is working.");
+  }
+
   publicClient.watchBlockNumber({
     emitOnBegin: true,
-    onBlockNumber: (bn) => {
-      void onBlock(bn);
-    },
+    onBlockNumber: (bn) => void onBlock(bn),
     onError: (err) => log(`watch error: ${revertReason(err)}`, "WARN"),
   });
 }

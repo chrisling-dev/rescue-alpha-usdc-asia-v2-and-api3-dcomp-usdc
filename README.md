@@ -1,120 +1,116 @@
-# Morpho vault withdrawal monitor
+# Morpho vault liquidity alarm
 
-Monitors two illiquid (100%-utilization) Morpho Blue markets and, the moment
-withdrawable liquidity appears, auto-withdraws the owner's position — racing the
-vault's other depositors.
+Sounds a loud alarm the moment withdrawable liquidity appears in two illiquid
+(100%-utilization) Morpho Blue markets, so the owner can withdraw **manually**.
+There is **no automated withdrawal and no private key here** — the funds sit on a
+Trezor. When the alarm fires, the tool also prints a ready-to-paste
+`cast send --trezor` command that does the withdrawal with on-device confirmation.
 
 ## The two positions
 
-| Vault | Vault address | Underlying market | Collateral | Status |
-|---|---|---|---|---|
-| Alpha USDC Asia V2 | `0x35Cbe8542E70fa2f7F9cDF129F19e593F4b4f560` | `0xfd0d72…4cc2` | AZND | ~80% LTV (LLTV 86%), solvent, 100% util |
-| Api3 dCOMP USDC | `0x36cfe1568461E499391ef0A555300F1ae2da2439` | `0x24852d…0ea6` | dCOMP | ~40% LTV (LLTV 62.5%), solvent, 100% util |
+| Vault | Vault address | Underlying market | Collateral | Owner (Trezor) | Size |
+|---|---|---|---|---|---|
+| Alpha USDC Asia V2 | `0x35Cbe8…f560` | `0xfd0d72…4cc2` | AZND | `0x6b06…9b7c` | ~$250.3k |
+| Api3 dCOMP USDC | `0x36cfe1…2439` | `0x24852d…0ea6` | dCOMP | `0xd876…646a` | ~$118.2k |
 
-Both have **$0 bad debt** today. Money is illiquid, not lost. Liquidity returns
-when a borrower repays, a position is liquidated, or new deposits arrive — then
+Both have **$0 bad debt** — money is illiquid, not lost. Liquidity returns when a
+borrower repays, a position is liquidated, or new deposits arrive — then
 withdrawal is a first-come-first-served race. Windows can be short: on 2026-06-25
-the dCOMP market briefly held **$226.97k** of liquidity and it was re-borrowed
-within ~6 minutes.
+the dCOMP market briefly held **$226.97k** and it was re-borrowed within ~6 min.
 
 Liquidity is read directly from Morpho Blue (`0xBBBB…FFCb`):
-`liquidity = market.totalSupplyAssets − market.totalBorrowAssets` (exact, no
-interest accrual needed at 100% util).
+`liquidity = market.totalSupplyAssets − market.totalBorrowAssets` (exact at 100%
+util, no interest accrual needed).
 
-## How withdrawal actually works on these vaults (important)
+## Why a plain withdraw won't work (important)
 
-A plain ERC-4626 `withdraw`/`redeem` **reverts with an arithmetic underflow** —
-the vault's automatic liquidity path is fed empty/misconfigured market data, and
-`maxWithdraw(owner)` returns 0 even when the market has liquidity. (This is why
-the app header shows "Liquidity $< 0.01" while the allocation table shows the
-market's real 226.97k.)
+A normal ERC-4626 `withdraw`/`redeem` **reverts with an arithmetic underflow** on
+these vaults — the auto-liquidity path is fed empty/misconfigured market data, and
+`maxWithdraw(owner)` returns 0 even when the market has liquidity. (That's why the
+app header shows "Liquidity $< 0.01" while the allocation table shows the market's
+real 226.97k.)
 
-The working exit is to pull liquidity from the market into the vault's idle
-balance yourself and withdraw it in the **same transaction**, atomically:
+The working exit pulls liquidity from the market into the vault's idle balance and
+withdraws it in the **same transaction**, atomically:
 
 ```
 multicall([
-    forceDeallocate(adapter, abi.encode(marketParams), amount, owner),
-    withdraw(amount, receiver, owner),
+  forceDeallocate(adapter, abi.encode(marketParams), amount, owner),
+  withdraw(amount, receiver, owner),
 ])
 ```
 
-`forceDeallocate` charges a penalty: **~0.01% on dCOMP, ~2% on AZND**. The script
-**simulates the multicall (eth_call) before broadcasting**, so a closed/shrunk
-window just reverts harmlessly (gas only) and it retries on the next block. This
-was verified on-chain: `forceDeallocate` succeeded while the 226.97k window was
-open and reverts with `insufficient liquidity` when it's closed.
-
-The owners are **verified on-chain** and baked into `src/config.ts` (different
-wallet per vault, so each needs its own signer):
-
-| Vault | Owner | Position |
-|---|---|---|
-| Alpha USDC Asia V2 | `0x6b06da993b1f12d82463fec75006913f98499b7c` | ~$250.3k |
-| Api3 dCOMP USDC | `0xd87617659957f4d9cea85e9db85b2f1de677646a` | ~$118.2k |
+`forceDeallocate` charges a penalty: **~0.01% on dCOMP, ~2% on AZND**. The alarm
+only fires when this multicall **simulates successfully** (so no false alarms),
+and it prints that exact command for you to run.
 
 ## Stack
 
-TypeScript + [viem](https://viem.sh), run with `tsx`. Files:
-`src/config.ts` (addresses, markets, owners, knobs), `src/abi.ts`, `src/monitor.ts`.
+TypeScript + [viem](https://viem.sh), run with `tsx`. Files: `src/config.ts`
+(addresses, markets, owners, knobs), `src/abi.ts`, `src/monitor.ts`.
 
 ```bash
 npm install
-npm run typecheck   # optional
+cp .env.example .env     # optional — tweak knobs; no keys needed
 ```
 
-## Run (safe, no broadcasts)
+## Run
 
 ```bash
 npm start
 ```
 
-Starts in **DRY_RUN**: per block it reads both markets, and when a window opens
-it *simulates* the forceDeallocate+withdraw multicall and logs what it WOULD
-broadcast — but sends nothing. Watch the heartbeat to confirm it's live.
+That's it — no keys, nothing to broadcast. It reads both markets every block and
+prints a heartbeat. When a real window opens it:
+1. prints a 🚨 banner with the market liquidity, your position, and the amount,
+2. plays a loud, repeating sound + macOS notification + spoken announcement,
+3. prints the exact `cast send --trezor …` command to withdraw.
 
-## Run live (auto-withdraw)
+Test the sound first so you know it's audible:
 
 ```bash
-DRY_RUN=0 \
-PRIVATE_KEY_ALPHA=0x...   \  # owner 0x6b06…9b7c (AZND vault) — omit to skip this vault
-PRIVATE_KEY_API3=0x...    \  # owner 0xd876…646a (dCOMP vault) — omit to skip this vault
-PRIORITY_GWEI=10 \
-npm start
+TEST_ALARM=1 npm start
 ```
 
-The private key for each vault **must** be that vault's owner (the script checks
-`account.address === owner` and refuses otherwise). ERC-4626 `withdraw` requires
-`msg.sender == owner`. Put some ETH for gas in each owner address. Secrets are
-never logged. You can run with just one key to cover only that vault.
+## When the alarm fires — withdraw with the Trezor
 
-## Key env vars
+Copy the printed command and run it (needs [Foundry](https://getfoundry.sh)'s
+`cast` + Trezor Suite/bridge running). It looks like:
+
+```bash
+cast send 0x36cfe1…2439 'multicall(bytes[])' '[0xe4d38cd8…,0xb460af94…]' \
+  --rpc-url <rpc> --trezor --priority-gas-price 10gwei
+```
+
+Confirm the transaction on the Trezor screen. The key never leaves the device.
+- If your Trezor account isn't on the default derivation path, add
+  `--mnemonic-derivation-path "m/44'/60'/0'/0/N"`.
+- The amount in the command is sized to the live window; if it shrank, the tx
+  reverts harmlessly — wait for the next alarm and use the fresh command.
+- The Morpho app *may* also work, but a plain "Withdraw" there can fail for the
+  reason above; the `cast` command is the reliable path.
+
+## Key env vars (all optional)
 
 | Var | Default | Meaning |
 |---|---|---|
-| `DRY_RUN` | `1` | `0` to actually broadcast |
-| `PRIVATE_KEY_ALPHA` / `PRIVATE_KEY_API3` | — | per-vault owner signer (live mode) |
-| `RECEIVER_ALPHA` / `RECEIVER_API3` | = owner | where withdrawn USDC lands |
-| `MIN_TRIGGER_USDC` | `50` | only act on liquidity ≥ this |
-| `SAFETY_BUFFER_USDC` | `1` | shave off the grab; covers penalty + rounding |
+| `MIN_TRIGGER_USDC` | `50` | only alarm when liquidity ≥ this |
+| `CONFIRM_BY_SIM` | `1` | only alarm if the withdrawal actually simulates |
+| `ALARM_COOLDOWN_SEC` | `8` | min seconds between sounds while a window stays open |
+| `ALARM_CMD` | macOS afplay | custom shell command to run on alarm |
+| `SAY` | `1` on macOS | speak the alert with `say` |
 | `POLL_SECONDS` | `4` | HTTP block-poll interval (~12s blocks) |
-| `PRIORITY_GWEI` | `5` | priority fee to win inclusion |
-| `MAX_FEE_GWEI` | auto | optional max fee per gas cap |
-| `RPC_HTTP` | publicnode | use a private/paid RPC for speed/reliability |
-| `RPC_WS` | — | set a `wss://` endpoint for true newHeads subscription |
-| `EXIT_AFTER_FULL` | `0` | `1` to stop once a position is fully drained |
+| `RPC_HTTP` | publicnode | a private/paid endpoint is more reliable |
+| `RPC_WS` | — | set a `wss://` endpoint for true newHeads (lower latency) |
+| `PRIORITY_GWEI` | `10` | priority fee written into the printed `cast` command |
+| `RECEIVER_ALPHA` / `RECEIVER_API3` | = owner | where withdrawn USDC lands |
 
-## Honest limitations
+## Notes / limitations
 
-- **Block-driven, not mempool-driven.** It reacts in block N+1 after a repay
-  lands in block N. Bots watching the mempool can bundle a withdraw *in the same
-  block* and beat you. (The 226.97k window stayed open ~6 min, so per-block has a
-  real shot — but it's not guaranteed.) Same-block competing needs mempool
-  watching + Flashbots bundling (a larger build).
-- Public RPCs rate-limit; for live racing use a private endpoint, set `RPC_WS`,
-  and/or lower `POLL_SECONDS`.
-- The **2% AZND penalty** means a full ~$250k exit there costs ~$5k. The dCOMP
-  penalty is negligible (~$12 on $118k). Decide if that tradeoff beats waiting.
-- The AZND market trends toward liquidation as ~79% APY interest compounds the
-  LTV upward (~weeks if price is flat); the dCOMP market is healthy with no
-  liquidation pressure, so it depends on the borrower repaying.
+- **Block-driven, not mempool-driven.** It detects a window in block N+1 after a
+  repay lands in N. Bots watching the mempool can act in the same block. The
+  ~6-min window we saw means a human with the Trezor has a real shot, but it's
+  not guaranteed.
+- Keep this running on a machine that stays awake with the speakers on.
+- The **2% AZND penalty** means a full ~$250k exit there costs ~$5k; dCOMP is
+  ~$12 on $118k. Decide if that beats waiting.

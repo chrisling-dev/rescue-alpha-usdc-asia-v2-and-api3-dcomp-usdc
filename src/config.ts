@@ -7,36 +7,41 @@ import { type Address, type Hex } from "viem";
 export const RPC_HTTP =
   process.env.RPC_HTTP ?? "https://ethereum-rpc.publicnode.com";
 // Optional WebSocket endpoint for true newHeads subscription (lower latency).
-// e.g. wss://ethereum-rpc.publicnode.com  — falls back to HTTP polling if unset.
 export const RPC_WS = process.env.RPC_WS ?? "";
 
 export const MORPHO_BLUE: Address =
   "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb";
 
-// Only act when at least this much liquidity AND owner position is available.
-// Units = USDC (human, e.g. 50 = $50).
+// Sound the alarm when market liquidity (and the owner's position) is at least
+// this many USDC.
 export const MIN_TRIGGER_USDC = Number(process.env.MIN_TRIGGER_USDC ?? "50");
 
-// Withdraw min(liquidity, ownerPosition) minus this buffer (USDC). Covers the
-// forceDeallocate penalty + rounding, and reduces same-block reverts.
+// Shave this off the suggested withdraw amount (covers forceDeallocate penalty
+// + rounding so the manual tx doesn't revert at the edge). USDC.
 export const SAFETY_BUFFER_USDC = Number(process.env.SAFETY_BUFFER_USDC ?? "1");
 
-// HTTP block-poll interval (ms). Blocks are ~12s; 3-4s catches every block.
+// HTTP block-poll interval (ms). ~12s blocks; 3-4s catches every block.
 // Ignored when RPC_WS is set (we subscribe to newHeads instead).
 export const POLL_MS = Number(process.env.POLL_SECONDS ?? "4") * 1000;
 
-// DRY_RUN=1 (default): simulate + print, broadcast nothing.
-// DRY_RUN=0: actually broadcast (requires a per-vault signer below).
-export const DRY_RUN = (process.env.DRY_RUN ?? "1") !== "0";
+// Before alarming, simulate the forceDeallocate+withdraw to confirm the window
+// is REALLY actionable (not just a transient read). 1 = on (recommended).
+export const CONFIRM_BY_SIM = (process.env.CONFIRM_BY_SIM ?? "1") !== "0";
 
-// Aggressive gas to win the inclusion race.
-export const PRIORITY_GWEI = process.env.PRIORITY_GWEI ?? "5";
-export const MAX_FEE_GWEI = process.env.MAX_FEE_GWEI ?? ""; // empty = auto
+// Don't re-trigger the sound more often than this (seconds) while a window
+// stays open. The on-screen banner still prints every block.
+export const ALARM_COOLDOWN_SEC = Number(process.env.ALARM_COOLDOWN_SEC ?? "8");
+
+// Custom alarm shell command. Empty = built-in (macOS afplay loop). Runs on
+// every (cooldown-gated) trigger.
+export const ALARM_CMD = process.env.ALARM_CMD ?? "";
+// Speak the alert with macOS `say`. 1 = on (default on macOS).
+export const SAY = (process.env.SAY ?? (process.platform === "darwin" ? "1" : "0")) !== "0";
+
+// Priority fee used in the ready-to-run `cast send --trezor` command we print.
+export const PRIORITY_GWEI = process.env.PRIORITY_GWEI ?? "10";
 
 export const LOGFILE = process.env.LOGFILE ?? "morpho-monitor.log";
-
-// Stop monitoring a vault after its owner's position is fully drained.
-export const EXIT_AFTER_FULL = (process.env.EXIT_AFTER_FULL ?? "0") === "1";
 
 export interface MarketParams {
   loanToken: Address;
@@ -51,9 +56,8 @@ export interface VaultConfig {
   vault: Address;
   marketId: Hex;
   loanDecimals: number;
-  owner: Address; // verified share holder
+  owner: Address; // verified share holder (held on a Trezor)
   receiver: Address;
-  keyEnv: string; // env var holding this owner's private key
   adapter: Address; // MorphoMarketV1 adapter
   marketParams: MarketParams; // abi-encoded as `data` for forceDeallocate
   forcePenaltyBps: number; // informational
@@ -72,7 +76,6 @@ export const VAULTS: VaultConfig[] = [
     owner: "0x6b06da993b1f12d82463fec75006913f98499b7c",
     receiver: (process.env.RECEIVER_ALPHA ??
       "0x6b06da993b1f12d82463fec75006913f98499b7c") as Address,
-    keyEnv: "PRIVATE_KEY_ALPHA",
     adapter: "0xc3E1DC28DaFB8369d8BE52334472a87Dd61AbA49",
     marketParams: {
       loanToken: USDC,
@@ -92,7 +95,6 @@ export const VAULTS: VaultConfig[] = [
     owner: "0xd87617659957f4d9cea85e9db85b2f1de677646a",
     receiver: (process.env.RECEIVER_API3 ??
       "0xd87617659957f4d9cea85e9db85b2f1de677646a") as Address,
-    keyEnv: "PRIVATE_KEY_API3",
     adapter: "0x0854c79eC9600FD1d02caA14Ef0527f93bb5e4cc",
     marketParams: {
       loanToken: USDC,
