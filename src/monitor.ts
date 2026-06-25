@@ -11,20 +11,13 @@
  *     liquidity = market.totalSupplyAssets - market.totalBorrowAssets
  * Exact at 100% utilization (interest accrues equally to supply and borrow).
  *
- * NO FALSE ALARMS: a normal ERC-4626 `withdraw` reverts with an arithmetic
- * underflow on these vaults (the auto-liquidity path is fed empty/misconfigured
- * market data) and `maxWithdraw` returns 0 even when the market has liquidity.
- * So instead of trusting a raw liquidity read, we gate the alarm on a successful
- * eth_call simulation of the real exit:
- *
- *     multicall([
- *       forceDeallocate(adapter, abi.encode(marketParams), amount, owner),
- *       withdraw(amount, receiver, owner),
- *     ])
- *
- * The alarm only fires when that simulation succeeds — i.e. when the funds are
- * genuinely withdrawable that block. The owner then withdraws manually (Morpho
- * app link is printed in the alert).
+ * The alarm fires on the on-chain liquidity reading itself: when the market has
+ * at least MIN_TRIGGER_USDC of available liquidity and the owner has a position.
+ * (An earlier version gated on simulating the full forceDeallocate+withdraw, but
+ * that suppressed real, minutes-long windows where the exact-max withdrawal
+ * didn't simulate — a false negative is the worst outcome here, so we trust the
+ * liquidity read and wake the human.) The owner then withdraws manually via the
+ * Morpho app (link printed in the alert).
  *
  * Trigger model: block-driven (newHeads via WebSocket if RPC_WS is set, else
  * HTTP block polling).
@@ -35,11 +28,8 @@ import {
   createPublicClient,
   http,
   webSocket,
-  encodeAbiParameters,
-  encodeFunctionData,
   formatUnits,
   parseUnits,
-  type Hex,
   type PublicClient,
   BaseError,
 } from "viem";
@@ -53,7 +43,6 @@ import {
   POLL_MS,
   MIN_TRIGGER_USDC,
   SAFETY_BUFFER_USDC,
-  CONFIRM_BY_SIM,
   ALARM_COOLDOWN_SEC,
   ALARM_CMD,
   SAY,
@@ -112,54 +101,6 @@ async function readOwnerAssets(v: VaultConfig): Promise<bigint> {
     functionName: "convertToAssets",
     args: [shares],
   });
-}
-
-// ── withdrawal command (forceDeallocate + withdraw multicall) ────────────────
-function encodeMarketParams(v: VaultConfig): Hex {
-  return encodeAbiParameters(
-    [
-      {
-        type: "tuple",
-        components: [
-          { name: "loanToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "oracle", type: "address" },
-          { name: "irm", type: "address" },
-          { name: "lltv", type: "uint256" },
-        ],
-      },
-    ],
-    [v.marketParams],
-  );
-}
-
-function buildCalls(v: VaultConfig, amount: bigint): [Hex, Hex] {
-  const forceDeallocate = encodeFunctionData({
-    abi: vaultAbi,
-    functionName: "forceDeallocate",
-    args: [v.adapter, encodeMarketParams(v), amount, v.owner],
-  });
-  const withdraw = encodeFunctionData({
-    abi: vaultAbi,
-    functionName: "withdraw",
-    args: [amount, v.receiver, v.owner],
-  });
-  return [forceDeallocate, withdraw];
-}
-
-async function wouldSucceed(v: VaultConfig, calls: [Hex, Hex]): Promise<boolean> {
-  try {
-    await publicClient.simulateContract({
-      account: v.owner,
-      address: v.vault,
-      abi: vaultAbi,
-      functionName: "multicall",
-      args: [[calls[0], calls[1]]],
-    });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // ── alarm ────────────────────────────────────────────────────────────────────
@@ -239,19 +180,12 @@ async function onBlock(blockNumber: bigint) {
       const amount = (liq < own ? liq : own) - bufferWei;
       if (amount <= 0n) continue;
 
-      const calls = buildCalls(v, amount);
-
-      // Only alarm if the withdrawal would actually succeed right now.
-      if (CONFIRM_BY_SIM && !(await wouldSucceed(v, calls))) {
-        if (!open.has(v.vault)) {
-          log(
-            `${v.name}: market shows ${formatUnits(liq, 6)} USDC but the ` +
-              `withdrawal does not simulate yet — not alarming.`,
-            "INFO",
-          );
-        }
-        continue;
-      }
+      // Alarm directly on the on-chain liquidity reading. We do NOT gate on a
+      // full forceDeallocate+withdraw simulation: these windows flicker in and
+      // out within a block, so by the time a heavier sim call returns the
+      // window may have momentarily closed — suppressing a REAL window (the
+      // worst outcome). Liquidity > 0 means it's genuinely withdrawable via the
+      // forceDeallocate+withdraw path; wake the human and let them race it.
 
       const liqH = formatUnits(liq, 6);
       const amtH = formatUnits(amount, 6);
@@ -268,11 +202,16 @@ async function onBlock(blockNumber: bigint) {
       );
       log(
         `    market liquidity: ${liqH} USDC   your position: ` +
-          `${formatUnits(own, 6)} USDC   -> withdraw up to ${amtH} USDC NOW`,
+          `${formatUnits(own, 6)} USDC   -> up to ~${amtH} USDC withdrawable NOW`,
         "ALERT",
       );
       log(
-        `    Withdraw now: https://app.morpho.org/ethereum/vault/${v.vault}`,
+        `    GO WITHDRAW: https://app.morpho.org/ethereum/vault/${v.vault}`,
+        "ALERT",
+      );
+      log(
+        `    (if it won't let you take the full amount, withdraw a bit less — ` +
+          `exact-max can fail)`,
         "ALERT",
       );
       log("🚨".repeat(20), "ALERT");
@@ -300,7 +239,7 @@ async function main() {
   log("Morpho Vault V2 liquidity ALARM starting (viem/TS) — alert only");
   log(`RPC=${RPC_WS || RPC_HTTP}  mode=${RPC_WS ? "newHeads" : "poll"}`);
   log(
-    `trigger>=${MIN_TRIGGER_USDC} USDC  confirmBySim=${CONFIRM_BY_SIM}  ` +
+    `trigger>=${MIN_TRIGGER_USDC} USDC  ` +
       `sound=${process.platform === "darwin" ? "macOS" : ALARM_CMD ? "custom" : "bell-only"}`,
   );
   for (const v of VAULTS) {

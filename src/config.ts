@@ -24,10 +24,6 @@ export const SAFETY_BUFFER_USDC = Number(process.env.SAFETY_BUFFER_USDC ?? "1");
 // Ignored when RPC_WS is set (we subscribe to newHeads instead).
 export const POLL_MS = Number(process.env.POLL_SECONDS ?? "4") * 1000;
 
-// Before alarming, simulate the forceDeallocate+withdraw to confirm the window
-// is REALLY actionable (not just a transient read). 1 = on (recommended).
-export const CONFIRM_BY_SIM = (process.env.CONFIRM_BY_SIM ?? "1") !== "0";
-
 // Don't re-trigger the sound more often than this (seconds) while a window
 // stays open. The on-screen banner still prints every block.
 export const ALARM_COOLDOWN_SEC = Number(process.env.ALARM_COOLDOWN_SEC ?? "8");
