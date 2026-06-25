@@ -22,6 +22,7 @@
  * Trigger model: block-driven (newHeads via WebSocket if RPC_WS is set, else
  * HTTP block polling).
  */
+import "./loadenv.js"; // MUST be first — populates process.env before config reads it
 import { appendFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import {
@@ -405,7 +406,14 @@ async function main() {
     );
     log("⚠️  Make sure the hot wallet holds the shares and has ETH for gas.");
   } else {
-    log("No private keys here. When it fires, withdraw manually.");
+    if (PRIVATE_KEY) {
+      log(
+        "⚠️  PRIVATE_KEY is set but EXECUTE is not 1 — running ALERT-ONLY and " +
+          "ignoring the key. Set EXECUTE=1 to actually auto-withdraw.",
+        "WARN",
+      );
+    }
+    log("No private keys active. When it fires, withdraw manually.");
   }
   log("=".repeat(70));
 

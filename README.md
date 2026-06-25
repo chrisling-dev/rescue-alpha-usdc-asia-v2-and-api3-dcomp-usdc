@@ -51,8 +51,13 @@ TypeScript + [viem](https://viem.sh), run with `tsx`. Files: `src/config.ts`
 
 ```bash
 npm install
-cp .env.example .env     # optional — tweak knobs; no keys needed
+cp .env.example .env     # copy to .env (Windows: `copy .env.example .env`)
 ```
+
+`.env` is **loaded automatically** on `npm start` (works on Windows/macOS/Linux);
+real shell env vars override it. On startup you'll see `[env] loaded N var(s)` —
+if it says `no .env found`, the file isn't next to `package.json`. For
+auto-withdraw, make sure `EXECUTE=1` is in the file or it stays alert-only.
 
 ## Run
 
