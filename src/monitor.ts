@@ -170,6 +170,28 @@ function buildMulticall(v: VaultConfig, amount: bigint): [Hex, Hex] {
 
 const submitting = new Set<string>(); // vaults with an in-flight tx
 
+// Sequential nonce allocator so two same-block withdrawals (both vaults from the
+// one hot wallet) don't grab the same pending nonce and collide.
+let managedNonce: number | undefined;
+let nonceChain: Promise<void> = Promise.resolve();
+async function allocNonce(): Promise<number> {
+  const prev = nonceChain;
+  let release!: () => void;
+  nonceChain = new Promise<void>((r) => (release = r));
+  await prev;
+  try {
+    if (managedNonce === undefined) {
+      managedNonce = await publicClient.getTransactionCount({
+        address: signer!.account.address,
+        blockTag: "pending",
+      });
+    }
+    return managedNonce++;
+  } finally {
+    release();
+  }
+}
+
 async function executeWithdraw(v: VaultConfig, amount: bigint, amtH: string) {
   if (!signer) return;
   if (submitting.has(v.vault)) return; // don't double-submit
@@ -181,6 +203,7 @@ async function executeWithdraw(v: VaultConfig, amount: bigint, amtH: string) {
         `(racing the bot, priority ${PRIORITY_GWEI} gwei)...`,
       "EXEC",
     );
+    const nonce = await allocNonce();
     const hash = await signer.client.writeContract({
       account: signer.account,
       chain: mainnet,
@@ -188,6 +211,7 @@ async function executeWithdraw(v: VaultConfig, amount: bigint, amtH: string) {
       abi: vaultAbi,
       functionName: "multicall",
       args: [[calls[0], calls[1]]],
+      nonce,
       gas: GAS_LIMIT, // fixed limit → skip estimateGas latency
       maxPriorityFeePerGas: parseGwei(PRIORITY_GWEI),
       ...(MAX_FEE_GWEI ? { maxFeePerGas: parseGwei(MAX_FEE_GWEI) } : {}),
@@ -201,6 +225,7 @@ async function executeWithdraw(v: VaultConfig, amount: bigint, amtH: string) {
     }
   } catch (err) {
     log(`    send failed: ${revertReason(err)}`, "WARN");
+    managedNonce = undefined; // resync from chain (pending count) next time
   } finally {
     submitting.delete(v.vault);
   }
