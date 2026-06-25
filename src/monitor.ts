@@ -383,9 +383,36 @@ async function main() {
     `trigger>=${MIN_TRIGGER_USDC} USDC  ` +
       `sound=${process.platform === "darwin" ? "macOS" : ALARM_CMD ? "custom" : "bell-only"}`,
   );
+  // Read each owner's share position up front and SAY it loudly — if it's 0,
+  // the wallet we're watching is empty (shares moved? wrong owner/mode?) and the
+  // bot can't do anything for that vault no matter what liquidity appears.
+  let anyShares = false;
   for (const v of VAULTS) {
     log(`  watching ${v.name}`);
     log(`    owner=${v.owner}  receiver=${v.receiver}`);
+    try {
+      const bal = await readOwnerAssets(v);
+      if (bal === 0n) {
+        log(
+          `    ⚠️  this owner holds 0 shares in this vault — nothing to ` +
+            `withdraw here. (Shares moved to a hot wallet? Then run with ` +
+            `EXECUTE=1 PRIVATE_KEY=<hot wallet>.)`,
+          "WARN",
+        );
+      } else {
+        anyShares = true;
+        log(`    position: ${formatUnits(bal, 6)} USDC ✓`);
+      }
+    } catch {
+      log(`    (could not read position — RPC issue)`, "WARN");
+    }
+  }
+  if (!anyShares) {
+    log(
+      "NONE of the watched owners hold any shares — the bot will sit idle. " +
+        "Point it at the wallet that holds the shares (see warning above).",
+      "ERROR",
+    );
   }
   if (EXECUTE) {
     // Sanity: the signer must own the shares it's withdrawing.
