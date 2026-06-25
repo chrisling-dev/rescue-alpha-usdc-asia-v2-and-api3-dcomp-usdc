@@ -197,6 +197,9 @@ const triggerWei = parseUnits(String(MIN_TRIGGER_USDC), 6);
 const bufferWei = parseUnits(String(SAFETY_BUFFER_USDC), 6);
 const open = new Set<string>(); // vaults currently in an open window (edge state)
 const lastSound = new Map<string, number>(); // vault -> ms timestamp
+// Print the "block … liquidity →" line every N blocks so you can see it's alive.
+// 1 = every block (~12s). Raise it if the log gets too chatty.
+const HEARTBEAT_BLOCKS = Number(process.env.HEARTBEAT_BLOCKS ?? "1");
 let processing = false;
 let heartbeat = 0;
 
@@ -283,7 +286,7 @@ async function onBlock(blockNumber: bigint) {
     }
 
     heartbeat += 1;
-    if (status.length && heartbeat % 25 === 1) {
+    if (status.length && (heartbeat - 1) % HEARTBEAT_BLOCKS === 0) {
       log(`block ${blockNumber}  liquidity → ${status.join("  ")}`);
     }
   } finally {
