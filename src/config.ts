@@ -1,4 +1,5 @@
 import { type Address, type Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 
 // ──────────────────────────────────────────────────────────────────────────
 // CONFIG  (env vars override these)
@@ -36,6 +37,32 @@ export const SAY = (process.env.SAY ?? (process.platform === "darwin" ? "1" : "0
 
 export const LOGFILE = process.env.LOGFILE ?? "morpho-monitor.log";
 
+// ── Auto-withdraw (optional) ─────────────────────────────────────────────────
+// To actually WIN the race against the draining bot, move the vault shares to a
+// fresh hot wallet and run in EXECUTE mode: the bot fires the same
+// forceDeallocate+withdraw multicall the winner uses, the instant liquidity
+// appears, and sends the USDC to RECEIVER (a safe/cold address).
+//
+//   EXECUTE=1
+//   PRIVATE_KEY=0x...      hot wallet that NOW HOLDS the vault shares
+//   OWNER=0x...            (optional) defaults to the PRIVATE_KEY address
+//   RECEIVER=0x...         where withdrawn USDC lands (default = OWNER) — set
+//                          this to a cold address you control
+export const EXECUTE = (process.env.EXECUTE ?? "0") === "1";
+export const PRIVATE_KEY = (process.env.PRIVATE_KEY ?? "") as Hex | "";
+// Single owner/receiver override applied to BOTH vaults (since the share-move
+// consolidates everything into one hot wallet). Per-vault RECEIVER_* still wins.
+export const OWNER_OVERRIDE = process.env.OWNER ?? "";
+export const RECEIVER_OVERRIDE = process.env.RECEIVER ?? "";
+// Priority fee (gwei) to win inclusion against the competing bot. Tune up if you
+// keep losing the race.
+export const PRIORITY_GWEI = process.env.PRIORITY_GWEI ?? "20";
+// Optional max fee per gas cap (gwei). Empty = let viem estimate.
+export const MAX_FEE_GWEI = process.env.MAX_FEE_GWEI ?? "";
+// Fixed gas limit so we skip an estimateGas round-trip (lower latency). The
+// multicall costs ~250-350k; 600k is safe headroom.
+export const GAS_LIMIT = BigInt(process.env.GAS_LIMIT ?? "600000");
+
 export interface MarketParams {
   loanToken: Address;
   collateralToken: Address;
@@ -67,8 +94,7 @@ export const VAULTS: VaultConfig[] = [
       "0xfd0d72a4f0469598b566b1bc5fe64835f828f90b1fb7d746148c086164cd4cc2",
     loanDecimals: 6,
     owner: "0x6b06da993b1f12d82463fec75006913f98499b7c",
-    receiver: (process.env.RECEIVER_ALPHA ??
-      "0x6b06da993b1f12d82463fec75006913f98499b7c") as Address,
+    receiver: (process.env.RECEIVER_ALPHA ?? "") as Address,
     adapter: "0xc3E1DC28DaFB8369d8BE52334472a87Dd61AbA49",
     marketParams: {
       loanToken: USDC,
@@ -86,8 +112,7 @@ export const VAULTS: VaultConfig[] = [
       "0x24852d8d7464402ddcd717415e009d42bf7427d6a8893487f83c75ee0f4a0ea6",
     loanDecimals: 6,
     owner: "0xd87617659957f4d9cea85e9db85b2f1de677646a",
-    receiver: (process.env.RECEIVER_API3 ??
-      "0xd87617659957f4d9cea85e9db85b2f1de677646a") as Address,
+    receiver: (process.env.RECEIVER_API3 ?? "") as Address,
     adapter: "0x0854c79eC9600FD1d02caA14Ef0527f93bb5e4cc",
     marketParams: {
       loanToken: USDC,
@@ -99,3 +124,23 @@ export const VAULTS: VaultConfig[] = [
     forcePenaltyBps: 1, // ~0.01%
   },
 ];
+
+// Resolve owner/receiver. In EXECUTE mode the shares have been moved into the
+// hot wallet, so owner defaults to the PRIVATE_KEY's address (unless OWNER is
+// set explicitly). Receiver precedence: per-vault RECEIVER_* > global RECEIVER
+// > owner.
+let hotAddr = "";
+if (PRIVATE_KEY) {
+  try {
+    hotAddr = privateKeyToAccount(PRIVATE_KEY).address;
+  } catch {
+    /* invalid key reported at startup */
+  }
+}
+const ownerOverride = OWNER_OVERRIDE || (EXECUTE ? hotAddr : "");
+for (const v of VAULTS) {
+  if (ownerOverride) v.owner = ownerOverride as Address;
+  if (!v.receiver) v.receiver = (RECEIVER_OVERRIDE || v.owner) as Address;
+}
+
+export const HOT_ADDRESS = hotAddr as Address | "";

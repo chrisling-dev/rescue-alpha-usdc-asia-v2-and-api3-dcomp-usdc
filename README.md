@@ -84,6 +84,51 @@ Heads-up: a plain "Withdraw" can fail on these vaults (the underflow above) — 
 the app errors or shows 0 withdrawable, you need the `forceDeallocate`+`withdraw`
 path instead. Ping me and I'll hand you the exact transaction to sign.
 
+## Auto-withdraw mode (to beat the draining bot)
+
+These windows are taken by an automated bot (e.g. `0x5B07d71f…`) that drains any
+liquidity within ~1–2 minutes. A human reacting to the alarm will usually lose.
+To actually recover the funds you must **automate** — but the shares are on a
+Trezor that can't export its key. The workaround: **move the vault shares to a
+fresh hot wallet** and let the bot sign from there. The withdrawn USDC is sent
+straight to a cold `RECEIVER`, so the hot wallet only ever holds shares.
+
+**Step 1 — make a fresh wallet.** Generate a brand-new private key/address used
+*only* for this. Fund it with ~0.02 ETH for gas.
+
+**Step 2 — move the shares (signed on the Trezor, once per vault).** The vault
+*is* the share ERC-20. Transfer your full balance to the new address — e.g. via
+Etherscan "Write Contract" (connect Trezor through MetaMask) calling
+`transfer(newWallet, amount)`, or `cast send <vault> "transfer(address,uint256)"
+<newWallet> <amount> --trezor`:
+
+| Vault (share token) | From (Trezor) | amount (full balance) |
+|---|---|---|
+| `0x35Cbe8542E70fa2f7F9cDF129F19e593F4b4f560` | `0x6b06…9b7c` | `243741816417157013848116` |
+| `0x36cfe1568461E499391ef0A555300F1ae2da2439` | `0xd876…646a` | `115040624393998888579688` |
+
+(Re-check `balanceOf` before sending — use the exact current value. You can move
+just one vault first to test, then the other.)
+
+**Step 3 — run the bot:**
+
+```bash
+EXECUTE=1 \
+PRIVATE_KEY=0x<new hot wallet key> \
+RECEIVER=0x<your cold address for the USDC> \
+PRIORITY_GWEI=20 \
+npm start
+```
+
+It validates the signer owns the shares, then fires the exact
+`forceDeallocate+withdraw` multicall the winning bot uses — the instant liquidity
+appears — sending USDC to `RECEIVER`. Raise `PRIORITY_GWEI` if you keep losing
+the race; set `RPC_WS` and a private RPC to cut latency.
+
+**Risk:** while running, the hot wallet holds the shares; if that key leaks,
+someone could withdraw to themselves. Use a dedicated fresh key, keep it only on
+the monitoring machine, and pull the USDC to cold storage as it arrives.
+
 ## Key env vars (all optional)
 
 | Var | Default | Meaning |

@@ -26,13 +26,22 @@ import { appendFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import {
   createPublicClient,
+  createWalletClient,
   http,
   webSocket,
+  encodeAbiParameters,
+  encodeFunctionData,
   formatUnits,
   parseUnits,
+  parseGwei,
+  getAddress,
+  type Account,
+  type Hex,
   type PublicClient,
+  type WalletClient,
   BaseError,
 } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { mainnet } from "viem/chains";
 import { morphoAbi, vaultAbi } from "./abi.js";
 import {
@@ -47,6 +56,12 @@ import {
   ALARM_CMD,
   SAY,
   LOGFILE,
+  EXECUTE,
+  PRIVATE_KEY,
+  PRIORITY_GWEI,
+  MAX_FEE_GWEI,
+  GAS_LIMIT,
+  HOT_ADDRESS,
   type VaultConfig,
 } from "./config.js";
 
@@ -101,6 +116,94 @@ async function readOwnerAssets(v: VaultConfig): Promise<bigint> {
     functionName: "convertToAssets",
     args: [shares],
   });
+}
+
+// ── auto-withdraw (EXECUTE mode) ─────────────────────────────────────────────
+// The exact forceDeallocate+withdraw multicall the winning bot uses. We send it
+// the instant liquidity appears, racing the competing bot. Confirmed on-chain
+// (block 25392975 replay): this succeeds for the owner whenever liquidity exists.
+let signer: { account: Account; client: WalletClient } | undefined;
+
+function loadSigner() {
+  if (!EXECUTE) return;
+  if (!PRIVATE_KEY) throw new Error("EXECUTE=1 but PRIVATE_KEY is not set");
+  const account = privateKeyToAccount(PRIVATE_KEY);
+  const client = createWalletClient({
+    account,
+    chain: mainnet,
+    transport: http(RPC_HTTP),
+  });
+  signer = { account, client };
+}
+
+function encodeMarketParams(v: VaultConfig): Hex {
+  return encodeAbiParameters(
+    [
+      {
+        type: "tuple",
+        components: [
+          { name: "loanToken", type: "address" },
+          { name: "collateralToken", type: "address" },
+          { name: "oracle", type: "address" },
+          { name: "irm", type: "address" },
+          { name: "lltv", type: "uint256" },
+        ],
+      },
+    ],
+    [v.marketParams],
+  );
+}
+
+function buildMulticall(v: VaultConfig, amount: bigint): [Hex, Hex] {
+  const forceDeallocate = encodeFunctionData({
+    abi: vaultAbi,
+    functionName: "forceDeallocate",
+    args: [v.adapter, encodeMarketParams(v), amount, v.owner],
+  });
+  const withdraw = encodeFunctionData({
+    abi: vaultAbi,
+    functionName: "withdraw",
+    args: [amount, v.receiver, v.owner],
+  });
+  return [forceDeallocate, withdraw];
+}
+
+const submitting = new Set<string>(); // vaults with an in-flight tx
+
+async function executeWithdraw(v: VaultConfig, amount: bigint, amtH: string) {
+  if (!signer) return;
+  if (submitting.has(v.vault)) return; // don't double-submit
+  submitting.add(v.vault);
+  const calls = buildMulticall(v, amount);
+  try {
+    log(
+      `>>> EXECUTING forceDeallocate+withdraw ${amtH} USDC from ${v.name} ` +
+        `(racing the bot, priority ${PRIORITY_GWEI} gwei)...`,
+      "EXEC",
+    );
+    const hash = await signer.client.writeContract({
+      account: signer.account,
+      chain: mainnet,
+      address: v.vault,
+      abi: vaultAbi,
+      functionName: "multicall",
+      args: [[calls[0], calls[1]]],
+      gas: GAS_LIMIT, // fixed limit → skip estimateGas latency
+      maxPriorityFeePerGas: parseGwei(PRIORITY_GWEI),
+      ...(MAX_FEE_GWEI ? { maxFeePerGas: parseGwei(MAX_FEE_GWEI) } : {}),
+    });
+    log(`    tx sent: ${hash}`, "EXEC");
+    const rcpt = await publicClient.waitForTransactionReceipt({ hash });
+    if (rcpt.status === "success") {
+      log(`    ✅ WITHDRAW CONFIRMED  tx=${hash}  block=${rcpt.blockNumber}`, "EXEC");
+    } else {
+      log(`    ❌ tx reverted (lost the race or window shrank)  tx=${hash}`, "EXEC");
+    }
+  } catch (err) {
+    log(`    send failed: ${revertReason(err)}`, "WARN");
+  } finally {
+    submitting.delete(v.vault);
+  }
 }
 
 // ── alarm ────────────────────────────────────────────────────────────────────
@@ -205,16 +308,23 @@ async function onBlock(blockNumber: bigint) {
           `${formatUnits(own, 6)} USDC   -> up to ~${amtH} USDC withdrawable NOW`,
         "ALERT",
       );
-      log(
-        `    GO WITHDRAW: https://app.morpho.org/ethereum/vault/${v.vault}`,
-        "ALERT",
-      );
-      log(
-        `    (if it won't let you take the full amount, withdraw a bit less — ` +
-          `exact-max can fail)`,
-        "ALERT",
-      );
+      if (EXECUTE) {
+        log(`    EXECUTE mode: firing the withdrawal now (racing the bot).`, "ALERT");
+      } else {
+        log(
+          `    GO WITHDRAW: https://app.morpho.org/ethereum/vault/${v.vault}`,
+          "ALERT",
+        );
+        log(
+          `    (if it won't let you take the full amount, withdraw a bit ` +
+            `less — exact-max can fail)`,
+          "ALERT",
+        );
+      }
       log("🚨".repeat(20), "ALERT");
+
+      // Fire the auto-withdraw (fire-and-forget; guarded against double-submit).
+      if (EXECUTE) void executeWithdraw(v, amount, amtH);
 
       const now = Date.now();
       if (now - (lastSound.get(v.vault) ?? 0) >= ALARM_COOLDOWN_SEC * 1000) {
@@ -235,17 +345,43 @@ async function onBlock(blockNumber: bigint) {
 
 // ── main ─────────────────────────────────────────────────────────────────────
 async function main() {
+  loadSigner();
+
   log("=".repeat(70));
-  log("Morpho Vault V2 liquidity ALARM starting (viem/TS) — alert only");
+  log(
+    `Morpho Vault V2 liquidity monitor (viem/TS) — ` +
+      `${EXECUTE ? "AUTO-WITHDRAW mode" : "ALERT ONLY"}`,
+  );
   log(`RPC=${RPC_WS || RPC_HTTP}  mode=${RPC_WS ? "newHeads" : "poll"}`);
   log(
     `trigger>=${MIN_TRIGGER_USDC} USDC  ` +
       `sound=${process.platform === "darwin" ? "macOS" : ALARM_CMD ? "custom" : "bell-only"}`,
   );
   for (const v of VAULTS) {
-    log(`  watching ${v.name}  owner=${v.owner}`);
+    log(`  watching ${v.name}`);
+    log(`    owner=${v.owner}  receiver=${v.receiver}`);
   }
-  log("No private keys here. When it fires, withdraw manually.");
+  if (EXECUTE) {
+    // Sanity: the signer must own the shares it's withdrawing.
+    for (const v of VAULTS) {
+      if (getAddress(v.owner) !== getAddress(HOT_ADDRESS as Hex)) {
+        log(
+          `owner for ${v.name} (${v.owner}) != signer ${HOT_ADDRESS}. Move the ` +
+            `shares to the signer, or set OWNER. Exiting.`,
+          "ERROR",
+        );
+        process.exit(1);
+      }
+    }
+    log(
+      `AUTO-WITHDRAW armed. Signer=${HOT_ADDRESS}, USDC -> ${VAULTS[0]!.receiver}. ` +
+        `priority=${PRIORITY_GWEI}gwei gas=${GAS_LIMIT}`,
+      "EXEC",
+    );
+    log("⚠️  Make sure the hot wallet holds the shares and has ETH for gas.");
+  } else {
+    log("No private keys here. When it fires, withdraw manually.");
+  }
   log("=".repeat(70));
 
   // Smoke-test the alarm once at startup so you know it's audible.
